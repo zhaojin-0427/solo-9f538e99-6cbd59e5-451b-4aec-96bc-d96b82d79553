@@ -39,6 +39,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/meters/{meter_id}/settlements` | 按表列结算摘要 |
 | GET | `/settlements` | 全部结算摘要 |
 | GET | `/settlements/{settlement_no}` | 结算明细（发布时快照） |
+| POST | `/difference-reports` | 生成总表与 1～3 个分表的逐小时差额报告 |
+| GET | `/difference-reports` | 差额报告摘要列表（含过期标记） |
+| GET | `/difference-reports/{report_no}` | 差额报告详情（过期边界与原差额明细） |
 | GET | `/healthz` | 健康检查 |
 
 交互式文档里可直接试调所有接口。
@@ -140,6 +143,63 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 }
 ```
 
+### 差额报告
+
+用于核查总表与 1～3 个分表的逐小时电量，定位需要排查的线路。请求体：
+
+```json
+{
+  "master_settlement_no": "STL-20261116T000000Z-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "sub_settlement_nos": [
+    "STL-20261116T000000Z-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "STL-20261116T000000Z-cccccccccccccccccccccccccccccccc"
+  ],
+  "tolerance": 5
+}
+```
+
+- `sub_settlement_nos` 必须含 1～3 个结算号且互不重复；`tolerance` 为非负整数。
+- 总表与各分表的电表编号必须互异；所有结算必须覆盖**同一段**连续 1～48 小时（起点、终点、小时数均相同）。
+- 各结算所用的边界读数必须仍是各表当前修订。只要有一处边界出现更高修订（或读数被删除），整单返回 409 `boundary_revision_superseded`，**不留半份报告**；数据员需基于最新修订重新发布结算后再试。
+- 校验通过后逐小时计算 `差额 = 总表用量 − 各分表用量之和`：
+  - 差额为负 → `negative`；差额大于容差 → `exceeds_tolerance`；二者均为异常时段，其余为 `ok`（差额恰等于容差不算异常）。
+- 报告与所用结算号、电表、边界修订、逐小时差额一并落库，报告号形如 `RPT-...`。
+
+失败响应（可能同时包含多个问题）：
+
+```json
+{
+  "code": "difference_report_rejected",
+  "message": "差额报告未生成：结算引用或边界读数校验未通过",
+  "atomic": true,
+  "problems": [
+    {
+      "code": "interval_mismatch",
+      "message": "结算 'STL-...' 覆盖 ... 与总表结算 ... 不一致",
+      "settlement_no": "STL-...",
+      "meter_id": "M-S1",
+      "start_hour": "2026-11-16T00:00:00Z",
+      "end_hour": "2026-11-16T01:00:00Z",
+      "hours": 1,
+      "expected_start_hour": "2026-11-16T00:00:00Z",
+      "expected_end_hour": "2026-11-16T02:00:00Z"
+    }
+  ]
+}
+```
+
+问题码：`settlement_not_found`（结算号不存在）、`duplicate_meter`（电表重复）、`interval_mismatch`（覆盖区间不一致）、`boundary_revision_superseded`（边界修订已被取代）。
+
+#### 过期语义
+
+报告保存的是生成时刻的差额快照。此后只要任一所用边界读数出现**新修订**——即使新修订的数值与原值完全相同——查询即返回：
+
+- 摘要与详情中的 `expired` 变为 `true`；
+- 详情给出 `stale_boundaries`，逐条列出电表、时刻、报告所用修订与当前修订（读数缺失时当前修订为 `null`）；
+- 原逐小时差额、异常结论与所用结算号保持不变，仍可追溯。
+
+区间之外时刻的更正不会使报告过期。
+
 ### 完整示例
 
 ```bash
@@ -168,6 +228,7 @@ curl -s $BASE/settlements
 - 录入和发布都在单个 SQLite `BEGIN IMMEDIATE` 事务中完成：谁先取得写锁，谁先被裁决；后到者读到前者已提交的状态。
 - 录入的版本校验与写入在同一事务内，不会出现“都校验通过、都写入”的同版双写。
 - 发布在同一写锁内读取读数、校验、写结算头与明细；中途失败整体回滚，不会留下可查询的半份结算。
+- 差额报告生成同样在单个 `BEGIN IMMEDIATE` 事务内完成全部校验与四类子表写入：与读数更正按提交顺序裁决，校验失败或写入失败整体回滚，不留半份报告。
 - 读接口使用独立读事务，看到的是完整提交状态。
 - SQLite 使用 WAL 模式与 30 秒 busy timeout；适用于单机本地部署，不支持多主机共享同一数据库文件。
 
@@ -180,4 +241,4 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-覆盖：UTC 整点/取值边界、幂等重传、旧版与同版异值整批回滚、批内同时刻冲突、回卷、500 上限边界、缺读数区间合并、发布快照不变性、发布失败无残留、以及多线程并发录入/发布与 HTTP 层并发一致性。
+覆盖：UTC 整点/取值边界、幂等重传、旧版与同版异值整批回滚、批内同时刻冲突、回卷、500 上限边界、缺读数区间合并、发布快照不变性、发布失败无残留、差额报告的容差边界/负值与超容差分类/结算号与电表互异/区间一致/边界修订校验/同值新修订即过期/失败无半份报告，以及多线程并发录入、发布、报告生成与 HTTP 层并发一致性。

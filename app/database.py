@@ -54,6 +54,53 @@ CREATE TABLE IF NOT EXISTS settlement_intervals (
     end_revision   INTEGER NOT NULL CHECK (end_revision > 0),
     PRIMARY KEY (settlement_no, seq)
 );
+
+CREATE TABLE IF NOT EXISTS difference_reports (
+    report_no               TEXT PRIMARY KEY,
+    master_settlement_no    TEXT    NOT NULL REFERENCES settlements(settlement_no) ON DELETE RESTRICT,
+    start_hour              TEXT    NOT NULL,
+    end_hour                TEXT    NOT NULL,
+    hours                   INTEGER NOT NULL CHECK (hours BETWEEN 1 AND 48),
+    tolerance               INTEGER NOT NULL CHECK (tolerance >= 0),
+    anomaly_count           INTEGER NOT NULL CHECK (anomaly_count >= 0),
+    created_at              TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_difference_reports_created
+    ON difference_reports (created_at DESC, report_no DESC);
+
+CREATE TABLE IF NOT EXISTS difference_report_meters (
+    report_no      TEXT    NOT NULL REFERENCES difference_reports(report_no) ON DELETE CASCADE,
+    role           TEXT    NOT NULL CHECK (role IN ('master', 'sub')),
+    seq            INTEGER NOT NULL CHECK (seq >= 0),
+    meter_id       TEXT    NOT NULL REFERENCES meters(meter_id) ON DELETE RESTRICT,
+    settlement_no  TEXT    NOT NULL REFERENCES settlements(settlement_no) ON DELETE RESTRICT,
+    PRIMARY KEY (report_no, role, seq)
+);
+
+CREATE TABLE IF NOT EXISTS difference_report_boundaries (
+    report_no      TEXT    NOT NULL REFERENCES difference_reports(report_no) ON DELETE CASCADE,
+    meter_id       TEXT    NOT NULL REFERENCES meters(meter_id) ON DELETE RESTRICT,
+    hour           TEXT    NOT NULL,
+    used_revision  INTEGER NOT NULL CHECK (used_revision > 0),
+    PRIMARY KEY (report_no, meter_id, hour)
+);
+
+CREATE INDEX IF NOT EXISTS idx_report_boundaries_meter_hour
+    ON difference_report_boundaries (meter_id, hour);
+
+CREATE TABLE IF NOT EXISTS difference_report_hours (
+    report_no       TEXT    NOT NULL REFERENCES difference_reports(report_no) ON DELETE CASCADE,
+    seq             INTEGER NOT NULL CHECK (seq >= 1),
+    hour_start      TEXT    NOT NULL,
+    hour_end        TEXT    NOT NULL,
+    master_usage    INTEGER NOT NULL CHECK (master_usage >= 0),
+    sub_usage_total INTEGER NOT NULL CHECK (sub_usage_total >= 0),
+    difference      INTEGER NOT NULL,
+    is_anomaly      INTEGER NOT NULL CHECK (is_anomaly IN (0, 1)),
+    reason          TEXT    NOT NULL CHECK (reason IN ('ok', 'negative', 'exceeds_tolerance')),
+    PRIMARY KEY (report_no, seq)
+);
 """
 
 

@@ -13,6 +13,10 @@ from .models import (
     MAX_HOURLY_USAGE,
     ROLLOVER,
     ConflictItem,
+    DifferenceHour,
+    DifferenceReportCreate,
+    DifferenceReportDetail,
+    DifferenceReportSummary,
     IngestItemResult,
     IngestResponse,
     MeterView,
@@ -20,9 +24,12 @@ from .models import (
     ReadingInput,
     ReadingSnapshot,
     ReadingView,
+    ReportMeterRef,
+    ReportProblem,
     SettlementDetail,
     SettlementInterval,
     SettlementSummary,
+    StaleBoundary,
     normalize_utc_hour,
 )
 
@@ -575,3 +582,520 @@ def list_settlements(
         )
         for row in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# 差额报告
+# ---------------------------------------------------------------------------
+
+
+def _load_settlement_refs(
+    conn: sqlite3.Connection, refs: list[str]
+) -> dict[str, dict]:
+    """按结算号读取结算头与全部区间（调用方已持有事务）。"""
+    result: dict[str, dict] = {}
+    for ref in refs:
+        header = conn.execute(
+            "SELECT * FROM settlements WHERE settlement_no = ?", (ref,)
+        ).fetchone()
+        if header is None:
+            continue
+        intervals = conn.execute(
+            "SELECT * FROM settlement_intervals WHERE settlement_no = ? ORDER BY seq",
+            (ref,),
+        ).fetchall()
+        result[ref] = {"header": header, "intervals": intervals}
+    return result
+
+
+def _current_revisions_for_pairs(
+    conn: sqlite3.Connection, pairs: list[tuple[str, str]]
+) -> dict[tuple[str, str], int]:
+    """批量返回每个 (meter_id, hour) 的当前修订号；该时刻已无读数时键缺失。"""
+    hours_by_meter: dict[str, set[str]] = {}
+    for meter_id, hour in pairs:
+        hours_by_meter.setdefault(meter_id, set()).add(hour)
+
+    current: dict[tuple[str, str], int] = {}
+    for meter_id, hours in hours_by_meter.items():
+        ordered = sorted(hours)
+        placeholders = ",".join("?" for _ in ordered)
+        rows = conn.execute(
+            f"SELECT hour, MAX(revision) AS revision FROM readings "
+            f"WHERE meter_id = ? AND hour IN ({placeholders}) GROUP BY hour",
+            (meter_id, *ordered),
+        ).fetchall()
+        for row in rows:
+            current[(meter_id, row["hour"])] = row["revision"]
+    return current
+
+
+def _stale_from_map(
+    boundaries: list[tuple[str, str, int]],
+    current_revisions: dict[tuple[str, str], int],
+) -> list[StaleBoundary]:
+    """边界读数当前修订与报告所用修订不一致（含读数缺失）即判过期。"""
+    stale: list[StaleBoundary] = []
+    for meter_id, hour, used_revision in boundaries:
+        current_revision = current_revisions.get((meter_id, hour))
+        if current_revision != used_revision:
+            stale.append(
+                StaleBoundary(
+                    meter_id=meter_id,
+                    hour=hour,
+                    used_revision=used_revision,
+                    current_revision=current_revision,
+                )
+            )
+    stale.sort(key=lambda b: (b.meter_id, b.hour))
+    return stale
+
+
+def _collect_stale_boundaries(
+    conn: sqlite3.Connection, boundaries: list[tuple[str, str, int]]
+) -> list[StaleBoundary]:
+    """边界读数当前修订与报告所用修订不一致（含读数缺失）即判过期。"""
+    current_revisions = _current_revisions_for_pairs(
+        conn, [(meter_id, hour) for meter_id, hour, _ in boundaries]
+    )
+    return _stale_from_map(boundaries, current_revisions)
+
+
+def create_difference_report(
+    conn: sqlite3.Connection, payload: DifferenceReportCreate
+) -> DifferenceReportDetail:
+    refs = [payload.master_settlement_no, *payload.sub_settlement_nos]
+    problems: list[ReportProblem] = []
+
+    with write_tx(conn):
+        # 与读数更正共用同一写锁：提交顺序即裁决顺序。
+        loaded = _load_settlement_refs(conn, refs)
+        missing = [ref for ref in refs if ref not in loaded]
+        for ref in missing:
+            problems.append(
+                ReportProblem(
+                    code="settlement_not_found",
+                    message=f"结算号 {ref!r} 不存在",
+                    settlement_no=ref,
+                )
+            )
+
+        present_refs = [ref for ref in refs if ref in loaded]
+
+        # 电表编号互异（总表与各分表不得是同一块表）。
+        meter_of = {
+            ref: loaded[ref]["header"]["meter_id"] for ref in present_refs
+        }
+        seen_meters: dict[str, str] = {}
+        duplicated_meters: set[str] = set()
+        for ref in present_refs:
+            meter_id = meter_of[ref]
+            if meter_id in seen_meters:
+                duplicated_meters.add(meter_id)
+            else:
+                seen_meters[meter_id] = ref
+        for meter_id in sorted(duplicated_meters):
+            dup_refs = [ref for ref in present_refs if meter_of[ref] == meter_id]
+            problems.append(
+                ReportProblem(
+                    code="duplicate_meter",
+                    message=(
+                        f"电表 {meter_id!r} 在总表与分表中重复出现，"
+                        "各结算必须来自互异电表"
+                    ),
+                    meter_id=meter_id,
+                    settlement_no=dup_refs[0],
+                )
+            )
+
+        # 所有结算必须覆盖同一段连续小时。
+        master_ref = payload.master_settlement_no
+        if master_ref in loaded:
+            master_header = loaded[master_ref]["header"]
+            master_start = master_header["start_hour"]
+            master_end = master_header["end_hour"]
+            master_hours = master_header["hours"]
+            for ref in present_refs:
+                header = loaded[ref]["header"]
+                if (
+                    header["start_hour"] != master_start
+                    or header["end_hour"] != master_end
+                    or header["hours"] != master_hours
+                ):
+                    problems.append(
+                        ReportProblem(
+                            code="interval_mismatch",
+                            message=(
+                                f"结算 {ref!r} 覆盖 {header['start_hour']} 至 "
+                                f"{header['end_hour']}（{header['hours']} 小时），"
+                                f"与总表结算 {master_start} 至 {master_end}"
+                                f"（{master_hours} 小时）不一致"
+                            ),
+                            settlement_no=ref,
+                            meter_id=header["meter_id"],
+                            start_hour=header["start_hour"],
+                            end_hour=header["end_hour"],
+                            hours=header["hours"],
+                            expected_start_hour=master_start,
+                            expected_end_hour=master_end,
+                        )
+                    )
+        else:
+            # 总表缺失时无法锚定公共区间，后续校验跳过。
+            master_start = master_end = ""
+            master_hours = 0
+
+        interval_aligned = set(present_refs)
+        if master_ref in loaded:
+            for ref in present_refs:
+                header = loaded[ref]["header"]
+                if (
+                    header["start_hour"] != master_start
+                    or header["end_hour"] != master_end
+                    or header["hours"] != master_hours
+                ):
+                    interval_aligned.discard(ref)
+
+        # 所用边界读数必须仍是各表当前修订。
+        boundary_pairs: list[tuple[str, str]] = []
+        used_revision: dict[tuple[str, str], int] = {}
+        for ref in interval_aligned:
+            meter_id = loaded[ref]["header"]["meter_id"]
+            for interval in loaded[ref]["intervals"]:
+                for boundary, revision in (
+                    (interval["hour_start"], interval["start_revision"]),
+                    (interval["hour_end"], interval["end_revision"]),
+                ):
+                    key = (meter_id, boundary)
+                    # 同一 (meter, hour) 在相邻区间重复出现，且快照内修订必然一致。
+                    used_revision.setdefault(key, revision)
+                    if key not in boundary_pairs:
+                        boundary_pairs.append(key)
+
+        current_revisions = _current_revisions_for_pairs(conn, boundary_pairs)
+        for meter_id, hour in boundary_pairs:
+            used = used_revision[(meter_id, hour)]
+            current = current_revisions.get((meter_id, hour))
+            if current != used:
+                problems.append(
+                    ReportProblem(
+                        code="boundary_revision_superseded",
+                        message=(
+                            f"电表 {meter_id!r} 在 {hour} 的边界读数修订 {used} "
+                            f"已不是当前修订（当前：{current}），请基于最新结算重试"
+                        ),
+                        meter_id=meter_id,
+                        hour=hour,
+                        used_revision=used,
+                        current_revision=current,
+                    )
+                )
+
+        if problems:
+            problems.sort(key=lambda p: (p.code, p.settlement_no or "", p.hour or ""))
+            raise ApiError(
+                409,
+                "difference_report_rejected",
+                "差额报告未生成：结算引用或边界读数校验未通过",
+                atomic=True,
+                problems=problems,
+            )
+
+        # 校验全部通过：逐小时计算总表用量减去分表用量之和。
+        master_intervals = loaded[master_ref]["intervals"]
+        sub_usage_by_seq: dict[int, int] = {
+            seq: 0 for seq in range(1, master_hours + 1)
+        }
+        for ref in payload.sub_settlement_nos:
+            for interval in loaded[ref]["intervals"]:
+                sub_usage_by_seq[interval["seq"]] += interval["usage"]
+
+        hours_detail: list[DifferenceHour] = []
+        anomaly_count = 0
+        for interval in master_intervals:
+            seq = interval["seq"]
+            master_usage = interval["usage"]
+            sub_total = sub_usage_by_seq[seq]
+            difference = master_usage - sub_total
+            if difference < 0:
+                is_anomaly, reason = True, "negative"
+            elif difference > payload.tolerance:
+                is_anomaly, reason = True, "exceeds_tolerance"
+            else:
+                is_anomaly, reason = False, "ok"
+            anomaly_count += int(is_anomaly)
+            hours_detail.append(
+                DifferenceHour(
+                    seq=seq,
+                    hour_start=interval["hour_start"],
+                    hour_end=interval["hour_end"],
+                    master_usage=master_usage,
+                    sub_usage_total=sub_total,
+                    difference=difference,
+                    tolerance=payload.tolerance,
+                    is_anomaly=is_anomaly,
+                    reason=reason,
+                )
+            )
+
+        created_at = utc_now_text()
+        report_no = (
+            "RPT-"
+            + parse_hour_text(master_start).strftime("%Y%m%dT%H%M%SZ")
+            + "-"
+            + uuid.uuid4().hex
+        )
+        conn.execute(
+            "INSERT INTO difference_reports "
+            "(report_no, master_settlement_no, start_hour, end_hour, hours, "
+            " tolerance, anomaly_count, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                report_no,
+                master_ref,
+                master_start,
+                master_end,
+                master_hours,
+                payload.tolerance,
+                anomaly_count,
+                created_at,
+            ),
+        )
+
+        meter_rows: list[tuple[str, str, int, str, str]] = [
+            (
+                report_no,
+                "master",
+                0,
+                loaded[master_ref]["header"]["meter_id"],
+                master_ref,
+            )
+        ]
+        for index, ref in enumerate(payload.sub_settlement_nos, start=1):
+            meter_rows.append(
+                (
+                    report_no,
+                    "sub",
+                    index,
+                    loaded[ref]["header"]["meter_id"],
+                    ref,
+                )
+            )
+        conn.executemany(
+            "INSERT INTO difference_report_meters "
+            "(report_no, role, seq, meter_id, settlement_no) "
+            "VALUES (?, ?, ?, ?, ?)",
+            meter_rows,
+        )
+
+        conn.executemany(
+            "INSERT INTO difference_report_boundaries "
+            "(report_no, meter_id, hour, used_revision) VALUES (?, ?, ?, ?)",
+            [
+                (report_no, meter_id, hour, used_revision[(meter_id, hour)])
+                for meter_id, hour in boundary_pairs
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO difference_report_hours "
+            "(report_no, seq, hour_start, hour_end, master_usage, "
+            " sub_usage_total, difference, is_anomaly, reason) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    report_no,
+                    item.seq,
+                    item.hour_start,
+                    item.hour_end,
+                    item.master_usage,
+                    item.sub_usage_total,
+                    item.difference,
+                    int(item.is_anomaly),
+                    item.reason,
+                )
+                for item in hours_detail
+            ],
+        )
+
+        meter_refs: list[ReportMeterRef] = [
+            ReportMeterRef(
+                role="master",
+                meter_id=loaded[master_ref]["header"]["meter_id"],
+                settlement_no=master_ref,
+                seq=0,
+            )
+        ]
+        for index, ref in enumerate(payload.sub_settlement_nos, start=1):
+            meter_refs.append(
+                ReportMeterRef(
+                    role="sub",
+                    meter_id=loaded[ref]["header"]["meter_id"],
+                    settlement_no=ref,
+                    seq=index,
+                )
+            )
+
+        return DifferenceReportDetail(
+            report_no=report_no,
+            master_settlement_no=master_ref,
+            sub_settlement_nos=list(payload.sub_settlement_nos),
+            meter_ids=[row[3] for row in meter_rows],
+            start_hour=master_start,
+            end_hour=master_end,
+            hours=master_hours,
+            tolerance=payload.tolerance,
+            anomaly_count=anomaly_count,
+            created_at=created_at,
+            meters=meter_refs,
+            hours_detail=hours_detail,
+            stale_boundaries=[],
+            expired=False,
+        )
+
+
+def _report_not_found(report_no: str) -> ApiError:
+    return ApiError(
+        404,
+        "difference_report_not_found",
+        f"差额报告 {report_no!r} 不存在",
+        report_no=report_no,
+    )
+
+
+def get_difference_report(
+    conn: sqlite3.Connection, report_no: str
+) -> DifferenceReportDetail:
+    with read_tx(conn):
+        header = conn.execute(
+            "SELECT * FROM difference_reports WHERE report_no = ?", (report_no,)
+        ).fetchone()
+        if header is None:
+            raise _report_not_found(report_no)
+        meter_rows = conn.execute(
+            "SELECT * FROM difference_report_meters WHERE report_no = ? "
+            "ORDER BY seq",
+            (report_no,),
+        ).fetchall()
+        hour_rows = conn.execute(
+            "SELECT * FROM difference_report_hours WHERE report_no = ? ORDER BY seq",
+            (report_no,),
+        ).fetchall()
+        boundary_rows = conn.execute(
+            "SELECT * FROM difference_report_boundaries WHERE report_no = ?",
+            (report_no,),
+        ).fetchall()
+        stale = _collect_stale_boundaries(
+            conn,
+            [
+                (row["meter_id"], row["hour"], row["used_revision"])
+                for row in boundary_rows
+            ],
+        )
+
+    sub_refs = [row["settlement_no"] for row in meter_rows if row["role"] == "sub"]
+    meter_ids = [row["meter_id"] for row in meter_rows]
+    return DifferenceReportDetail(
+        report_no=header["report_no"],
+        master_settlement_no=header["master_settlement_no"],
+        sub_settlement_nos=sub_refs,
+        meter_ids=meter_ids,
+        start_hour=header["start_hour"],
+        end_hour=header["end_hour"],
+        hours=header["hours"],
+        tolerance=header["tolerance"],
+        anomaly_count=header["anomaly_count"],
+        created_at=header["created_at"],
+        meters=[
+            ReportMeterRef(
+                role=row["role"],
+                meter_id=row["meter_id"],
+                settlement_no=row["settlement_no"],
+                seq=row["seq"],
+            )
+            for row in meter_rows
+        ],
+        hours_detail=[
+            DifferenceHour(
+                seq=row["seq"],
+                hour_start=row["hour_start"],
+                hour_end=row["hour_end"],
+                master_usage=row["master_usage"],
+                sub_usage_total=row["sub_usage_total"],
+                difference=row["difference"],
+                tolerance=header["tolerance"],
+                is_anomaly=bool(row["is_anomaly"]),
+                reason=row["reason"],
+            )
+            for row in hour_rows
+        ],
+        stale_boundaries=stale,
+        expired=bool(stale),
+    )
+
+
+def list_difference_reports(
+    conn: sqlite3.Connection, limit: int
+) -> list[DifferenceReportSummary]:
+    with read_tx(conn):
+        headers = conn.execute(
+            "SELECT * FROM difference_reports "
+            "ORDER BY created_at DESC, report_no DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        if not headers:
+            return []
+        report_nos = [row["report_no"] for row in headers]
+        placeholders = ",".join("?" for _ in report_nos)
+        meter_rows = conn.execute(
+            f"SELECT * FROM difference_report_meters "
+            f"WHERE report_no IN ({placeholders})",
+            report_nos,
+        ).fetchall()
+        boundary_rows = conn.execute(
+            f"SELECT * FROM difference_report_boundaries "
+            f"WHERE report_no IN ({placeholders})",
+            report_nos,
+        ).fetchall()
+
+        meters_by_report: dict[str, list[sqlite3.Row]] = {}
+        for row in meter_rows:
+            meters_by_report.setdefault(row["report_no"], []).append(row)
+        for rows in meters_by_report.values():
+            rows.sort(key=lambda r: r["seq"])
+
+        boundaries_by_report: dict[str, list[tuple[str, str, int]]] = {}
+        all_pairs: list[tuple[str, str]] = []
+        for row in boundary_rows:
+            triple = (row["meter_id"], row["hour"], row["used_revision"])
+            boundaries_by_report.setdefault(row["report_no"], []).append(triple)
+            all_pairs.append((row["meter_id"], row["hour"]))
+
+        # 列表内所有报告涉及的边界一次性查当前修订，避免按报告重复查询。
+        current_revisions = _current_revisions_for_pairs(conn, all_pairs)
+
+        summaries: list[DifferenceReportSummary] = []
+        for header in headers:
+            report_no = header["report_no"]
+            stale = _stale_from_map(
+                boundaries_by_report.get(report_no, []), current_revisions
+            )
+            refs = meters_by_report[report_no]
+            sub_refs = [
+                row["settlement_no"] for row in refs if row["role"] == "sub"
+            ]
+            summaries.append(
+                DifferenceReportSummary(
+                    report_no=report_no,
+                    master_settlement_no=header["master_settlement_no"],
+                    sub_settlement_nos=sub_refs,
+                    meter_ids=[row["meter_id"] for row in refs],
+                    start_hour=header["start_hour"],
+                    end_hour=header["end_hour"],
+                    hours=header["hours"],
+                    tolerance=header["tolerance"],
+                    anomaly_count=header["anomaly_count"],
+                    created_at=header["created_at"],
+                    expired=bool(stale),
+                )
+            )
+    return summaries

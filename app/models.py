@@ -11,6 +11,7 @@ from pydantic import (
     BeforeValidator,
     Field,
     field_validator,
+    model_validator,
 )
 
 ROLLOVER = 10_000
@@ -179,3 +180,108 @@ class ConflictItem(BaseModel):
     provided_value: int
     current_revision: int | None = None
     current_value: int | None = None
+
+
+# 结算号/报告号在内部以 STL-/RPT- 前缀加十六进制片段生成；这里只做通用安全字符约束。
+REF_ID_PATTERN = re.compile(r"^[^\s/\\\x00-\x1f\x7f]{1,128}$")
+
+
+def validate_ref_id(value: str) -> str:
+    if not isinstance(value, str) or not REF_ID_PATTERN.fullmatch(value):
+        raise ValueError("编号须为 1～128 个字符，且不能包含空白、斜杠或控制字符")
+    return value
+
+
+class DifferenceReportCreate(BaseModel):
+    master_settlement_no: str
+    sub_settlement_nos: list[str] = Field(min_length=1, max_length=3)
+    tolerance: int = Field(strict=True, ge=0)
+
+    @field_validator("master_settlement_no")
+    @classmethod
+    def _master_ref(cls, value: str) -> str:
+        return validate_ref_id(value)
+
+    @field_validator("sub_settlement_nos")
+    @classmethod
+    def _sub_refs(cls, value: list[str]) -> list[str]:
+        for item in value:
+            validate_ref_id(item)
+        return value
+
+    @model_validator(mode="after")
+    def _distinct_refs(self) -> "DifferenceReportCreate":
+        if len(set(self.sub_settlement_nos)) != len(self.sub_settlement_nos):
+            raise ValueError("分表结算号不得重复")
+        return self
+
+
+class ReportMeterRef(BaseModel):
+    role: Literal["master", "sub"]
+    meter_id: str
+    settlement_no: str
+    seq: int
+
+
+class DifferenceHour(BaseModel):
+    seq: int
+    hour_start: str
+    hour_end: str
+    master_usage: int
+    sub_usage_total: int
+    difference: int
+    tolerance: int
+    is_anomaly: bool
+    reason: Literal["ok", "negative", "exceeds_tolerance"] | None = None
+
+
+class StaleBoundary(BaseModel):
+    meter_id: str
+    hour: str
+    used_revision: int | None
+    current_revision: int | None
+
+
+class DifferenceReportSummary(BaseModel):
+    report_no: str
+    master_settlement_no: str
+    sub_settlement_nos: list[str]
+    meter_ids: list[str]
+    start_hour: str
+    end_hour: str
+    hours: int
+    tolerance: int
+    anomaly_count: int
+    created_at: str
+    expired: bool
+
+
+class DifferenceReportDetail(DifferenceReportSummary):
+    meters: list[ReportMeterRef]
+    hours_detail: list[DifferenceHour]
+    stale_boundaries: list[StaleBoundary]
+
+
+class DifferenceReportList(BaseModel):
+    items: list[DifferenceReportSummary]
+    count: int
+
+
+class ReportProblem(BaseModel):
+    code: Literal[
+        "settlement_not_found",
+        "duplicate_meter",
+        "interval_mismatch",
+        "boundary_revision_superseded",
+    ]
+    message: str
+    settlement_no: str | None = None
+    meter_id: str | None = None
+    start_hour: str | None = None
+    end_hour: str | None = None
+    hours: int | None = None
+    expected_start_hour: str | None = None
+    expected_end_hour: str | None = None
+    hour: str | None = None
+    used_revision: int | None = None
+    current_revision: int | None = None

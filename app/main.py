@@ -15,6 +15,9 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from . import __version__
 from .database import connect, init_db, resolve_db_path
 from .models import (
+    DifferenceReportCreate,
+    DifferenceReportDetail,
+    DifferenceReportList,
     IngestResponse,
     MeterCreate,
     MeterCreateResult,
@@ -27,13 +30,17 @@ from .models import (
     SettlementList,
     UtcHour,
     validate_meter_id,
+    validate_ref_id,
 )
 from .service import (
     ApiError,
+    create_difference_report,
     create_meter,
+    get_difference_report,
     get_meter,
     get_settlement,
     ingest_readings,
+    list_difference_reports,
     list_meters,
     list_readings,
     list_settlements,
@@ -56,6 +63,13 @@ DESCRIPTION = """
 
 **已发布结算**
 - 结算号查询永远返回发布时的明细和读数修订，后续补录/更正不影响历史结果。
+
+**差额报告**
+- 提交 1 个总表与 1～3 个分表的已发布结算号（电表编号互异）及非负整数容差。
+- 各结算必须覆盖同一段 1～48 小时，且所用边界读数仍是各表当前修订，否则整单 409 拒绝、不留半份报告。
+- 逐小时计算总表用量减去分表用量之和；负值或超过容差的时段列为异常，报告与所用结算号一并落库。
+- 报告生成与读数更正按 SQLite 写锁的提交顺序裁决。
+- 此后任一所用边界读数出现新修订（即使数值未变），查询即标明 `expired=true` 并列出过期边界；原差额明细仍可追溯。
 """
 
 
@@ -70,6 +84,9 @@ def _get_conn(request: Request) -> Iterator[sqlite3.Connection]:
 Conn = Annotated[sqlite3.Connection, Depends(_get_conn)]
 MeterId = Annotated[
     str, Path(min_length=1, max_length=64), AfterValidator(validate_meter_id)
+]
+ReportNo = Annotated[
+    str, Path(min_length=1, max_length=128), AfterValidator(validate_ref_id)
 ]
 
 
@@ -307,6 +324,60 @@ def create_app(db_path: str | None = None) -> FastAPI:
     )
     def get_settlement_detail(settlement_no: str, conn: Conn) -> SettlementDetail:
         return get_settlement(conn, settlement_no)
+
+    @app.post(
+        "/difference-reports",
+        response_model=DifferenceReportDetail,
+        status_code=201,
+        tags=["差额报告"],
+        summary="生成总表与 1～3 个分表的逐小时差额报告",
+        responses={
+            409: {
+                "description": "结算不存在、电表重复、区间不一致或边界读数已被新修订取代，未生成报告",
+                "content": {"application/json": {"example": {
+                    "code": "difference_report_rejected",
+                    "message": "差额报告未生成：结算引用或边界读数校验未通过",
+                    "atomic": True,
+                    "problems": [{
+                        "code": "boundary_revision_superseded",
+                        "message": "电表 'M-001' 在 2026-11-16T01:00:00Z 的边界读数修订 1 已不是当前修订（当前：2），请基于最新结算重试",
+                        "meter_id": "M-001",
+                        "hour": "2026-11-16T01:00:00Z",
+                        "used_revision": 1,
+                        "current_revision": 2,
+                    }],
+                }}},
+            },
+        },
+    )
+    def post_difference_report(
+        payload: DifferenceReportCreate, conn: Conn
+    ) -> DifferenceReportDetail:
+        return create_difference_report(conn, payload)
+
+    @app.get(
+        "/difference-reports",
+        response_model=DifferenceReportList,
+        tags=["差额报告"],
+        summary="列出差额报告摘要（含过期标记）",
+    )
+    def get_difference_reports(
+        conn: Conn,
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> DifferenceReportList:
+        items = list_difference_reports(conn, limit)
+        return DifferenceReportList(items=items, count=len(items))
+
+    @app.get(
+        "/difference-reports/{report_no}",
+        response_model=DifferenceReportDetail,
+        tags=["差额报告"],
+        summary="查询差额报告（过期时给出过期边界，原差额仍可追溯）",
+    )
+    def get_difference_report_detail(
+        report_no: ReportNo, conn: Conn
+    ) -> DifferenceReportDetail:
+        return get_difference_report(conn, report_no)
 
     return app
 

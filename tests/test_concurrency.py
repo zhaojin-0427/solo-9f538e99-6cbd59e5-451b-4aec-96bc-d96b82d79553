@@ -12,8 +12,13 @@ from fastapi.testclient import TestClient
 
 from app.database import connect, init_db
 from app.main import create_app
-from app.models import ReadingInput
-from app.service import ApiError, ingest_readings, publish_settlement
+from app.models import DifferenceReportCreate, ReadingInput
+from app.service import (
+    ApiError,
+    create_difference_report,
+    ingest_readings,
+    publish_settlement,
+)
 
 HOUR = datetime(2026, 11, 16, tzinfo=timezone.utc)
 
@@ -333,5 +338,279 @@ def test_concurrent_http_ingest_and_publish_never_half_visible(db_path, monkeypa
                 errors.append(exc)
 
         run_threads([reader, corrector, publisher])
+        if errors:
+            raise errors[0]
+
+
+def _seed_two_meters_with_settlements(db_path: str):
+    """返回 (总表结算号, 分表结算号)。"""
+    init_db(db_path)
+    conn = connect(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO meters (meter_id, name, created_at) VALUES ('M-MASTER', NULL, 'x')"
+            )
+            conn.execute(
+                "INSERT INTO meters (meter_id, name, created_at) VALUES ('M-SUB1', NULL, 'x')"
+            )
+            for hour, value in ((0, 0), (1, 10), (2, 30)):
+                conn.execute(
+                    "INSERT INTO readings (meter_id, hour, revision, value, received_at) "
+                    "VALUES ('M-MASTER', ?, 1, ?, 'x')",
+                    (f"2026-11-16T{hour:02d}:00:00Z", value),
+                )
+            for hour, value in ((0, 0), (1, 4), (2, 9)):
+                conn.execute(
+                    "INSERT INTO readings (meter_id, hour, revision, value, received_at) "
+                    "VALUES ('M-SUB1', ?, 1, ?, 'x')",
+                    (f"2026-11-16T{hour:02d}:00:00Z", value),
+                )
+    finally:
+        conn.close()
+
+    service_conn = connect(db_path)
+    try:
+        master = publish_settlement(service_conn, "M-MASTER", HOUR, 2).settlement_no
+        sub = publish_settlement(service_conn, "M-SUB1", HOUR, 2).settlement_no
+    finally:
+        service_conn.close()
+    return master, sub
+
+
+def test_report_waits_for_in_flight_correction_and_rejects_stale_snapshot(db_path):
+    """读数更正持锁时报告生成必须等待；提交后报告因边界修订过期而拒绝。"""
+    master, sub = _seed_two_meters_with_settlements(db_path)
+
+    writer = connect(db_path)
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute(
+        "INSERT INTO readings (meter_id, hour, revision, value, received_at) "
+        "VALUES ('M-MASTER', '2026-11-16T01:00:00Z', 2, 11, 'x')"
+    )
+    lock_held = threading.Event()
+    release = threading.Event()
+    outcomes: list[object] = []
+
+    def hold_then_commit():
+        lock_held.set()
+        assert release.wait(timeout=10)
+        writer.commit()
+
+    def make_report():
+        own = connect(db_path)
+        try:
+            lock_held.wait(timeout=10)
+            try:
+                create_difference_report(
+                    own,
+                    DifferenceReportCreate(
+                        master_settlement_no=master,
+                        sub_settlement_nos=[sub],
+                        tolerance=5,
+                    ),
+                )
+                outcomes.append("ok")
+            except ApiError as exc:
+                outcomes.append((exc.status_code, exc.code))
+        finally:
+            own.close()
+
+    holder = threading.Thread(target=hold_then_commit)
+    reporter = threading.Thread(target=make_report)
+    holder.start()
+    reporter.start()
+    assert lock_held.wait(timeout=10)
+    reporter.join(timeout=0.5)
+    assert reporter.is_alive(), "报告生成不应绕过未提交的读数更正"
+    release.set()
+    holder.join(timeout=10)
+    reporter.join(timeout=10)
+    assert not reporter.is_alive()
+    writer.close()
+
+    assert outcomes == [(409, "difference_report_rejected")]
+    check = connect(db_path)
+    try:
+        assert check.execute(
+            "SELECT COUNT(*) AS n FROM difference_reports"
+        ).fetchone()["n"] == 0
+        assert check.execute(
+            "SELECT COUNT(*) AS n FROM difference_report_hours"
+        ).fetchone()["n"] == 0
+    finally:
+        check.close()
+
+
+def test_concurrent_reports_serialize_and_store_complete_rows(db_path):
+    """并发报告生成按写锁串行化，每份报告的头/表/边界/小时行都完整。"""
+    master, sub = _seed_two_meters_with_settlements(db_path)
+    payload = DifferenceReportCreate(
+        master_settlement_no=master,
+        sub_settlement_nos=[sub],
+        tolerance=5,
+    )
+    results: list[object] = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(5)
+
+    def make_report():
+        def run():
+            own = connect(db_path)
+            try:
+                barrier.wait(timeout=10)
+                report = create_difference_report(own, payload)
+                with lock:
+                    results.append(report)
+            finally:
+                own.close()
+
+        return run
+
+    run_threads([make_report() for _ in range(5)])
+
+    assert len(results) == 5
+    report_nos = {r.report_no for r in results}
+    assert len(report_nos) == 5
+    for report in results:
+        assert len(report.hours_detail) == 2
+        assert report.expired is False
+
+    check = connect(db_path)
+    try:
+        assert check.execute(
+            "SELECT COUNT(*) AS n FROM difference_reports"
+        ).fetchone()["n"] == 5
+        assert check.execute(
+            "SELECT COUNT(*) AS n FROM difference_report_meters"
+        ).fetchone()["n"] == 10
+        assert check.execute(
+            "SELECT COUNT(*) AS n FROM difference_report_hours"
+        ).fetchone()["n"] == 10
+        # 每份报告 2 个表 x 3 个边界整点 = 6 行
+        assert check.execute(
+            "SELECT COUNT(*) AS n FROM difference_report_boundaries"
+        ).fetchone()["n"] == 30
+    finally:
+        check.close()
+
+
+def test_failed_report_insert_rolls_back_everything(db_path):
+    """小时行写入失败时，报告头与其他子表整体回滚，不留半份报告。"""
+    master, sub = _seed_two_meters_with_settlements(db_path)
+    conn = connect(db_path)
+    try:
+        conn.execute(
+            "CREATE TRIGGER block_report_hours BEFORE INSERT ON difference_report_hours "
+            "BEGIN SELECT RAISE(ABORT, 'simulated failure'); END;"
+        )
+        with pytest.raises(sqlite3.Error):
+            create_difference_report(
+                conn,
+                DifferenceReportCreate(
+                    master_settlement_no=master,
+                    sub_settlement_nos=[sub],
+                    tolerance=5,
+                ),
+            )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM difference_reports"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM difference_report_meters"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM difference_report_boundaries"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM difference_report_hours"
+        ).fetchone()[0] == 0
+        # 原结算与读数未受影响
+        assert conn.execute(
+            "SELECT COUNT(*) FROM settlements"
+        ).fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_http_concurrent_correction_and_report_never_half_visible(db_path, monkeypatch):
+    """HTTP 层并发：更正与报告生成交错，可查到的报告始终完整，过期判定与修订状态一致。"""
+    monkeypatch.setenv("ENERGY_DB_PATH", db_path)
+    app = create_app(db_path)
+    with TestClient(app) as client:
+        for meter_id, values in (
+            ("M-MASTER", [0, 10, 30]),
+            ("M-SUB1", [0, 4, 9]),
+        ):
+            client.post("/meters", json={"meter_id": meter_id})
+            client.post(
+                f"/meters/{meter_id}/readings",
+                json={"readings": [
+                    {"hour": f"2026-11-16T{h:02d}:00:00Z", "value": v, "revision": 1}
+                    for h, v in enumerate(values)
+                ]},
+            )
+        master = client.post(
+            "/meters/M-MASTER/settlements",
+            json={"start_hour": "2026-11-16T00:00:00Z", "hours": 2},
+        ).json()["settlement_no"]
+        sub = client.post(
+            "/meters/M-SUB1/settlements",
+            json={"start_hour": "2026-11-16T00:00:00Z", "hours": 2},
+        ).json()["settlement_no"]
+
+        errors: list[BaseException] = []
+
+        def corrector():
+            try:
+                for rev in range(2, 7):
+                    response = client.post(
+                        "/meters/M-MASTER/readings",
+                        json={"readings": [
+                            {"hour": "2026-11-16T01:00:00Z",
+                             "value": 10 + rev, "revision": rev}
+                        ]},
+                    )
+                    assert response.status_code == 200
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def reporter():
+            try:
+                for _ in range(10):
+                    response = client.post(
+                        "/difference-reports",
+                        json={
+                            "master_settlement_no": master,
+                            "sub_settlement_nos": [sub],
+                            "tolerance": 5,
+                        },
+                    )
+                    # 更正已提交后，基于旧快照的报告必须被拒绝
+                    assert response.status_code in (201, 409)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def reader():
+            try:
+                for _ in range(10):
+                    listing = client.get("/difference-reports").json()
+                    for summary in listing["items"]:
+                        detail = client.get(
+                            f"/difference-reports/{summary['report_no']}"
+                        ).json()
+                        assert len(detail["hours_detail"]) == detail["hours"]
+                        assert len(detail["meters"]) == 2
+                        # 同一响应内过期标记与过期边界列表必须一致
+                        assert detail["expired"] == bool(detail["stale_boundaries"])
+                        assert summary["anomaly_count"] == detail["anomaly_count"]
+                        # 列表与详情是两个独立读事务，期间可能有更正提交，
+                        # 因此只校验单调方向：详情看到的过期不会比摘要更少。
+                        if summary["expired"]:
+                            assert detail["expired"] is True
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        run_threads([corrector, reporter, reader])
         if errors:
             raise errors[0]
